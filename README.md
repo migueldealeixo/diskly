@@ -5,8 +5,9 @@ where disk space goes, identify development artifacts, and describe the impact o
 potential cleanup operations.
 
 **Status:** early development. The current implementation is a read-only Python
-scanner library. The desktop interface, artifact detectors, rankings, progress,
-and cancellation are not implemented yet. No cleanup operations are available.
+scanner library with progress reporting and cooperative cancellation. The desktop
+interface, artifact detectors, and rankings are not implemented yet. No cleanup
+operations are available.
 
 ## Development setup
 
@@ -78,6 +79,67 @@ and `max_index_bytes` to change the database budget (minimum 16 KiB). The worksp
 is private and removed after normal completion or handled failures. Failure to
 create it propagates to the caller. Only application-owned temporary data is
 written; scanned user files are not modified.
+
+## Progress and cancellation
+
+```python
+from diskly.scanner import CancellationToken, ScanProgress, scan_directory
+
+token = CancellationToken()
+
+
+def display(progress: ScanProgress) -> None:
+    print(progress.status, progress.entries_count, progress.logical_bytes)
+
+
+result = scan_directory(
+    "/path/to/a/directory",
+    cancellation_token=token,
+    on_progress=display,
+)
+```
+
+Call `token.cancel()` from another thread, a progress callback, or a future UI
+controller. The token is thread-safe and one-way: create a new token to restart.
+The scanner itself remains synchronous and does not create a background worker.
+
+- Progress values are immutable snapshots with the current directory, entry/file
+  counts, logical and allocated bytes, issue count, status, and elapsed time.
+- Entry counts include encountered child names, including exclusions and entries
+  that could not be fully processed. The selected root is not an entry.
+- Running updates are throttled to one every 0.2 seconds by default, with separate
+  initial and terminal notifications. Small scans may emit only those two events.
+  `progress_interval` accepts any finite positive interval in seconds.
+- No percentage is reported because the final number of entries is unknown.
+- Callbacks run in the scanning thread. Keep them quick; a future Qt adapter must
+  forward snapshots to the GUI thread rather than update widgets directly.
+- Callback exceptions raise `ProgressCallbackError` with the original exception
+  as the cause. They are not treated as filesystem or SQLite failures.
+- A cancelled scan returns `status == "cancelled"` and the counters and issues
+  accumulated before stopping. Descriptors and temporary storage are closed before
+  the terminal callback and before return. Cancellation does not imply resumability.
+- A token cancelled before starting bypasses root access and returns zero counters;
+  `filesystem_type` is then unavailable (`None`). Invalid numeric options still
+  raise validation errors. Cancellation during setup may also leave the filesystem
+  type unavailable.
+- A cancellation request made by a terminal callback does not change the result
+  that has already been finalized.
+- Root/setup failures still raise exceptions. They do not produce a successful
+  terminal progress event; the caller must handle exceptions as well as results.
+- `elapsed_seconds` uses a monotonic clock and includes setup, callbacks, and
+  resource cleanup through result finalization, excluding the terminal callback.
+
+Runnable terminal demonstrations:
+
+```bash
+python examples/scan_progress.py . --exclude .venv --exclude .git
+python examples/scan_progress.py /path/to/a/large/directory --cancel-after 0.1
+python examples/scan_progress.py . --cancel-after 0
+```
+
+The timed example requests cancellation after the specified number of seconds.
+A small scan can finish first. A zero delay deterministically cancels before root
+access. Neither the example nor the scanner deletes scanned files.
 
 ## Quality checks
 

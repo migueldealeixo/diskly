@@ -2,3 +2,4 @@ include .pre-commit-config.yaml
 recursive-include docs *.md
 recursive-include tests *.py
 recursive-include benchmarks *.py
+recursive-include examples *.py

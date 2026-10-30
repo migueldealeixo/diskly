@@ -3,7 +3,8 @@
 ## Scope
 
 The current increments establish packaging, quality checks, immutable result models,
-mount-aware traversal, explicit exclusions, and disk-backed identity indexes.
+mount-aware traversal, explicit exclusions, disk-backed identity indexes,
+progress snapshots, and cooperative cancellation.
 The scanner can be tested without Qt. This does not complete Diskly v0.1.
 
 The reference platform is Ubuntu 24.04 on x86-64 with Python 3.12. The core uses
@@ -122,14 +123,56 @@ and library overhead. Large-tree benchmarks remain necessary.
 
 ## Remaining work before the desktop MVP
 
-1. Progress events and cooperative cancellation independent of Qt.
-2. Directory summaries and bounded rankings with explicit metrics.
-3. Qt worker integration and the first desktop screen.
-4. Contextual artifact detection and informational recommendations.
-5. Broader filesystem, failure-recovery, and large-tree validation.
+1. Directory summaries and bounded rankings with explicit metrics.
+2. Qt worker integration and the first desktop screen.
+3. Contextual artifact detection and informational recommendations.
+4. Broader filesystem, failure-recovery, and large-tree validation.
 
 Tests use disposable temporary directories. No destructive test targets real user
 or system directories.
+
+## Progress and cancellation contract
+
+`CancellationToken` wraps a standard-library threading event. Cancellation is
+idempotent, one-way, and independent of any Qt event loop. Each restarted scan
+needs a fresh token. `scan_directory` is still a synchronous operation; its future
+application/Qt adapter will own background execution.
+
+The scanner polls cancellation before and between setup stages, iterator work,
+metadata access, and index updates. Child-directory resources have explicit
+ownership transfer to the traversal stack, so cancellation before that transfer
+also closes the child descriptor. Cooperative checks cannot interrupt a blocked
+filesystem call, a callback, or resource cleanup already in progress.
+
+Cancellation returns the observations retained so far with `cancelled` status,
+preserving existing issues. It does not erase user data, resume a prior traversal,
+or fabricate totals for unvisited entries. A pre-cancelled request performs no
+root access and has zero counters and no filesystem type. Numeric validation
+still runs first. Setup errors otherwise retain their exception behavior.
+
+Immutable `ScanProgress` snapshots carry the root, current directory, status,
+monotonic elapsed time, encountered-entry and file counters, sizes, and issue
+count. Entries count names returned by iterators, including excluded names and
+names not fully processed after a cancellation or error. Root directories are
+counted separately. The accumulator is never shared with consumers.
+
+The default running-update interval is 0.2 seconds. Initial and terminal snapshots
+are emitted separately and may be closer together. There is no pre-count or
+estimated percentage. With no callback, no progress snapshots are allocated.
+
+Callbacks execute synchronously in the scanning thread, without holding a token
+lock. They can request cancellation. Future UI callbacks must enqueue immutable
+snapshots for the GUI thread. Exceptions from callbacks are wrapped in
+`ProgressCallbackError` with their original cause, then propagated; they must not
+be mistaken for failures in the temporary index.
+
+Result finalization and terminal progress happen after descriptors, the SQLite
+connection, and the temporary workspace close. The terminal status and counters
+match the returned result; cancellation during that terminal callback cannot
+retroactively change them. Total elapsed time includes setup, regular callbacks,
+and resource cleanup, but excludes terminal callback time. If setup or a callback
+raises instead of returning a result, no successful terminal event is guaranteed;
+the future worker adapter must signal that failure explicitly.
 
 ## References
 
@@ -138,6 +181,8 @@ or system directories.
 - [Linux descriptor metadata](https://man7.org/linux/man-pages/man5/proc_pid_fdinfo.5.html)
 - [XDG base directories](https://specifications.freedesktop.org/basedir/latest/)
 - [Python SQLite interface](https://docs.python.org/3.12/library/sqlite3.html)
+- [Threading events](https://docs.python.org/3.12/library/threading.html#event-objects)
+- [Monotonic clock](https://docs.python.org/3.12/library/time.html#time.monotonic)
 - [SQLite configuration](https://www.sqlite.org/pragma.html)
 - [Writing pyproject.toml](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/)
 - [pytest temporary directories](https://docs.pytest.org/en/stable/how-to/tmp_path.html)

@@ -4,8 +4,10 @@ from pathlib import Path
 
 
 class ScanStatus(StrEnum):
+    RUNNING = "running"
     COMPLETED = "completed"
     PARTIAL = "partial"
+    CANCELLED = "cancelled"
 
 
 class IssueCode(StrEnum):
@@ -28,6 +30,21 @@ class ScanIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class ScanProgress:
+    root: Path
+    current_path: Path
+    status: ScanStatus
+    elapsed_seconds: float
+    entries_count: int
+    files_count: int
+    unique_files_count: int
+    directories_count: int
+    logical_bytes: int
+    allocated_bytes: int | None
+    issues_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class ScanResult:
     root: Path
     status: ScanStatus
@@ -43,8 +60,10 @@ class ScanResult:
     issues: tuple[ScanIssue, ...]
     excluded_entries_count: int
     skipped_mounts_count: int
-    filesystem_type: str
+    filesystem_type: str | None
     excluded_paths: tuple[Path, ...]
+    entries_count: int
+    elapsed_seconds: float
 
     @property
     def issues_truncated(self) -> bool:
