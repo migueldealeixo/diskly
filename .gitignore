@@ -1,0 +1,32 @@
+# Local tooling and credentials
+/.agents/
+/.aws/
+/.codex/
+.env
+.env.*
+!.env.example
+
+# Python environments and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Test and quality tool output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Local editor and desktop files
+.idea/
+.vscode/
+.DS_Store
+*~
