@@ -30,6 +30,28 @@ class ScanIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class FileSummary:
+    path: Path
+    logical_bytes: int
+    allocated_bytes: int | None
+    device: int
+    inode: int
+    link_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DirectorySummary:
+    path: Path
+    apparent_logical_bytes: int
+    apparent_allocated_bytes: int | None
+    files_count: int
+    directories_count: int
+    excluded_entries_count: int
+    issues_count: int
+    is_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ScanProgress:
     root: Path
     current_path: Path
@@ -64,6 +86,10 @@ class ScanResult:
     excluded_paths: tuple[Path, ...]
     entries_count: int
     elapsed_seconds: float
+    largest_files: tuple[FileSummary, ...]
+    largest_directories: tuple[DirectorySummary, ...]
+    root_directory: DirectorySummary | None
+    top_limit: int
 
     @property
     def issues_truncated(self) -> bool:

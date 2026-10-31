@@ -3,21 +3,31 @@ import sqlite3
 import stat
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
 
-from diskly.domain.scanning import IssueCode, ScanIssue, ScanProgress, ScanResult, ScanStatus
+from diskly.domain.scanning import (
+    DirectorySummary,
+    FileSummary,
+    IssueCode,
+    ScanIssue,
+    ScanProgress,
+    ScanResult,
+    ScanStatus,
+)
 from diskly.infrastructure.linux.mounts import read_mount_id
 from diskly.infrastructure.persistence.identity_index import (
     DEFAULT_MAX_INDEX_BYTES,
     MIN_INDEX_BYTES,
     IdentityIndex,
 )
+from diskly.scanner.aggregation import DirectoryAccumulator
 from diskly.scanner.control import CancellationToken, ProgressCallbackError
 from diskly.scanner.policy import ScanPolicy, build_policy
+from diskly.scanner.ranking import BoundedRanking
 
 
 @dataclass(slots=True)
@@ -27,10 +37,15 @@ class _DirectoryFrame:
     entries: Iterator[os.DirEntry[str]]
     metadata: os.stat_result
     resources: ExitStack
+    summary: DirectoryAccumulator = field(default_factory=DirectoryAccumulator)
+    issues_at_start: int = 0
 
 
 @dataclass(slots=True)
 class _Totals:
+    file_ranking: BoundedRanking[FileSummary]
+    directory_ranking: BoundedRanking[DirectorySummary]
+    root_directory: DirectorySummary | None = None
     entries: int = 0
     files: int = 0
     unique_files: int = 0
@@ -61,6 +76,13 @@ class _Totals:
         status = ScanStatus.PARTIAL if self.issues_count else ScanStatus.COMPLETED
         if cancelled:
             status = ScanStatus.CANCELLED
+        root_directory = self.root_directory
+        if root_directory is not None:
+            root_directory = replace(
+                root_directory,
+                issues_count=self.issues_count,
+                is_complete=root_directory.is_complete and status is ScanStatus.COMPLETED,
+            )
         return ScanResult(
             root=root,
             status=status,
@@ -88,6 +110,10 @@ class _Totals:
             else (),
             entries_count=self.entries,
             elapsed_seconds=elapsed_seconds,
+            largest_files=self.file_ranking.values(),
+            largest_directories=self.directory_ranking.values(),
+            root_directory=root_directory,
+            top_limit=self.file_ranking.limit,
         )
 
 
@@ -159,6 +185,22 @@ def _open_directory(path: Path, *, parent_fd: int | None = None) -> _DirectoryFr
         return _DirectoryFrame(path, descriptor, entries, metadata, resources.pop_all())
 
 
+def _finish_directory(frames: list[_DirectoryFrame], totals: _Totals, *, exhausted: bool) -> None:
+    frame = frames.pop()
+    try:
+        frame.summary.issues_count = totals.issues_count - frame.issues_at_start
+        summary = frame.summary.summary(frame.path, exhausted=exhausted)
+        if frames:
+            frames[-1].summary.merge(summary)
+            totals.directory_ranking.offer(
+                summary, size=summary.apparent_logical_bytes, path=summary.path
+            )
+        else:
+            totals.root_directory = summary
+    finally:
+        frame.resources.close()
+
+
 def scan_directory(
     root: str | os.PathLike[str],
     *,
@@ -170,6 +212,7 @@ def scan_directory(
     cancellation_token: CancellationToken | None = None,
     on_progress: Callable[[ScanProgress], None] | None = None,
     progress_interval: float = 0.2,
+    top_limit: int = 200,
 ) -> ScanResult:
     if max_depth < 0 or max_issues < 0:
         raise ValueError("max_depth and max_issues must be non-negative")
@@ -177,10 +220,12 @@ def scan_directory(
         raise ValueError(f"max_index_bytes must be at least {MIN_INDEX_BYTES}")
     if not isfinite(progress_interval) or progress_interval <= 0:
         raise ValueError("progress_interval must be finite and positive")
+    if not isinstance(top_limit, int) or top_limit < 0:
+        raise ValueError("top_limit must be a non-negative integer")
 
     root_path = Path(os.path.abspath(root))
     token = cancellation_token if cancellation_token is not None else CancellationToken()
-    totals = _Totals()
+    totals = _Totals(BoundedRanking(top_limit), BoundedRanking(top_limit))
     reporter = _ProgressReporter(
         root_path, totals, on_progress, progress_interval, monotonic(), root_path
     )
@@ -231,9 +276,8 @@ def scan_directory(
         _check_cancelled(token)
     except _ScanCancelled:
         cancelled = True
-    result = totals.result(
-        root_path, policy, cancelled=cancelled, elapsed_seconds=monotonic() - reporter.started
-    )
+    result = totals.result(root_path, policy, cancelled=cancelled, elapsed_seconds=0.0)
+    result = replace(result, elapsed_seconds=monotonic() - reporter.started)
     reporter.emit(
         reporter.current_path,
         status=result.status,
@@ -268,14 +312,14 @@ def _scan(
             try:
                 entry = next(frame.entries)
             except StopIteration:
-                frames.pop().resources.close()
+                _finish_directory(frames, totals, exhausted=True)
                 continue
             except OSError as error:
                 totals.record(
                     ScanIssue(frame.path, IssueCode.ACCESS_ERROR, str(error), error.errno),
                     max_issues,
                 )
-                frames.pop().resources.close()
+                _finish_directory(frames, totals, exhausted=False)
                 continue
 
             entry_path = frame.path / entry.name
@@ -283,6 +327,7 @@ def _scan(
             _check_cancelled(token)
             if policy.is_excluded(entry_path):
                 totals.excluded_entries += 1
+                frame.summary.excluded_entries_count += 1
                 continue
             if policy.is_mount_point(entry_path):
                 totals.skipped_mounts += 1
@@ -321,20 +366,32 @@ def _scan(
             if stat.S_ISLNK(metadata.st_mode):
                 totals.symlinks += 1
             elif stat.S_ISREG(metadata.st_mode):
+                is_unique = True
                 if metadata.st_nlink > 1:
                     _check_cancelled(token)
-                    if not index.add_file(*_identity(metadata)):
-                        totals.files += 1
-                        continue
+                    is_unique = index.add_file(*_identity(metadata))
                 _check_cancelled(token)
+                blocks: int | None = getattr(metadata, "st_blocks", None)
+                allocated_bytes = blocks * 512 if blocks is not None else None
                 totals.files += 1
+                frame.summary.add_file(metadata.st_size, allocated_bytes)
+                if not is_unique:
+                    continue
                 totals.unique_files += 1
                 totals.logical_bytes += metadata.st_size
-                blocks: int | None = getattr(metadata, "st_blocks", None)
-                if blocks is None:
+                if allocated_bytes is None:
                     totals.allocated_bytes = None
                 elif totals.allocated_bytes is not None:
-                    totals.allocated_bytes += blocks * 512
+                    totals.allocated_bytes += allocated_bytes
+                file_summary = FileSummary(
+                    path=entry_path,
+                    logical_bytes=metadata.st_size,
+                    allocated_bytes=allocated_bytes,
+                    device=metadata.st_dev,
+                    inode=metadata.st_ino,
+                    link_count=metadata.st_nlink,
+                )
+                totals.file_ranking.offer(file_summary, size=metadata.st_size, path=entry_path)
             elif stat.S_ISDIR(metadata.st_mode):
                 code: IssueCode | None = None
                 message = ""
@@ -411,11 +468,12 @@ def _scan(
                             max_issues,
                         )
                         continue
+                    child.issues_at_start = totals.issues_count
                     frames.append(child)
                     child.resources = child_resources.pop_all()
                     totals.directories += 1
             else:
                 totals.special_entries += 1
     finally:
-        for frame in reversed(frames):
-            frame.resources.close()
+        while frames:
+            _finish_directory(frames, totals, exhausted=False)

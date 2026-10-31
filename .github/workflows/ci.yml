@@ -11,6 +11,9 @@ jobs:
   checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTEST_QT_API: pyside6
     steps:
       - uses: actions/checkout@v6
         with:

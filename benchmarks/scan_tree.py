@@ -7,6 +7,7 @@ import tracemalloc
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from diskly.domain.scanning import ScanStatus
 from diskly.scanner import scan_directory
 
 
@@ -37,12 +38,22 @@ def main() -> None:
 
         if result.logical_bytes != count or result.unique_files_count != count:
             raise RuntimeError("Benchmark fixture was not counted correctly")
+        if result.status is not ScanStatus.COMPLETED or result.root_directory is None:
+            raise RuntimeError("Benchmark scan did not complete")
+        if result.root_directory.apparent_logical_bytes != 2 * count:
+            raise RuntimeError("Benchmark directory aggregation was not correct")
+        if len(result.largest_files) != min(count, result.top_limit):
+            raise RuntimeError("Benchmark file ranking was not bounded correctly")
+        if len(result.largest_directories) != min(count, result.top_limit):
+            raise RuntimeError("Benchmark directory ranking was not bounded correctly")
         print(
             json.dumps(
                 {
                     "directories": result.directories_count,
                     "file_names": result.files_count,
                     "unique_files": result.unique_files_count,
+                    "ranked_files": len(result.largest_files),
+                    "ranked_directories": len(result.largest_directories),
                     "status": result.status,
                     "seconds": round(elapsed, 3),
                     "python_peak_bytes_during_scan": python_peak_bytes,

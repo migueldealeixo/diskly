@@ -4,7 +4,8 @@
 
 The current increments establish packaging, quality checks, immutable result models,
 mount-aware traversal, explicit exclusions, disk-backed identity indexes,
-progress snapshots, and cooperative cancellation.
+progress snapshots, cooperative cancellation, bounded rankings, and directory
+summaries, and the first PySide6 desktop interface.
 The scanner can be tested without Qt. This does not complete Diskly v0.1.
 
 The reference platform is Ubuntu 24.04 on x86-64 with Python 3.12. The core uses
@@ -16,7 +17,8 @@ only the Python standard library and performs no cleanup operations.
 - `scanner`: incremental filesystem traversal producing domain results.
 - `infrastructure/linux`: process mount metadata and descriptor identities.
 - `infrastructure/persistence`: disposable SQLite identity index.
-- `ui`, `application`, detectors, and persistence will be introduced when needed.
+- `ui`: Qt widgets, bounded table models, themes, and a background scan adapter.
+- Application services, detectors, and durable persistence will be introduced when needed.
 
 There is no plugin system, service layer, or generic persistence abstraction yet.
 
@@ -31,8 +33,9 @@ There is no plugin system, service layer, or generic persistence abstraction yet
 - Directory counts include the root and successfully entered descendants.
 - Sizes are observations, not guarantees of recoverable storage.
 
-These metrics must remain explicit when future versions add directory rankings,
-categories, metadata accounting, and snapshots.
+These metrics remain explicit as categories, metadata accounting, and snapshots
+are introduced. Directory rankings use apparent-size fields to distinguish them
+from global unique totals.
 
 ## Traversal policy
 
@@ -121,12 +124,56 @@ and no Python collection grows with the number of visited directory or hard-link
 identities. Total memory still depends on depth, mount count, configured exclusions,
 and library overhead. Large-tree benchmarks remain necessary.
 
+## Bounded rankings and directory aggregation
+
+Each scan maintains separate bounded min-heaps for files and directories, retaining
+up to `top_limit` candidates per ranking (200 by default). Replacement compares
+logical size, then the absolute path as a Python string; results are sorted once
+at finalization. Values themselves are never compared, including when keys tie.
+Zero disables both rankings. No list of every scanned file or directory is kept.
+
+File candidates are created only for unique observed inodes. Multiply linked files
+use the existing SQLite identity index; the first observed name represents that
+inode and supplies its measured sizes and link count. Traversal order can change
+this representative name. This is not duplicate-content detection and the stored
+link count does not imply all links are inside the selected root.
+
+Each active traversal frame has a fixed-size accumulator for direct file names,
+visited directories, sizes, exclusions, and coverage. A child accumulator merges
+into its parent when the child closes, without updating every ancestor for every
+file. The child's immutable summary is offered to the directory heap and then
+discarded unless retained. The selected root has a separate summary and never
+occupies a directory-ranking slot.
+
+Directory size fields are explicitly apparent: they count every observed regular
+file name, including hard-link aliases. Global size totals and file rankings remain
+deduplicated. Parent and descendant directory rankings overlap and must not be
+added together or used as exclusive physical-storage attribution. Reported block
+allocations can be unavailable and are not estimates of recoverable storage.
+
+Issue-counter deltas at frame entry and exit determine subtree issue counts in
+the depth-first traversal. Exclusions define scope and preserve completeness;
+failed access, skipped mounts, limits, and unfinished iterators mark affected
+subtrees incomplete. The root also reflects scan-wide storage failures. Unentered
+directories have no summary rather than an invented zero size.
+
+When traversal stops, remaining frames merge their observed prefixes while closing
+resources, retaining incomplete summaries and file candidates collected so far.
+Already completed sibling summaries stay complete. A cancelled or partial scan
+therefore exposes only the largest observed candidates, with no claim that they
+are the largest entries of the unvisited tree. The root summary is always marked
+incomplete for a cancelled or partial result.
+
+Additional live ranking memory is proportional to the configured limit and active
+depth, plus retained path lengths. SQLite identity-cache and mount/exclusion memory
+have the separate limits described above. Finalization time includes sorting the
+retained rankings before terminal progress is emitted.
+
 ## Remaining work before the desktop MVP
 
-1. Directory summaries and bounded rankings with explicit metrics.
-2. Qt worker integration and the first desktop screen.
-3. Contextual artifact detection and informational recommendations.
-4. Broader filesystem, failure-recovery, and large-tree validation.
+1. Contextual artifact detection and informational recommendations.
+2. Broader filesystem, failure-recovery, and large-tree validation.
+3. Desktop polish, volume capacity, configurable scope, and distribution validation.
 
 Tests use disposable temporary directories. No destructive test targets real user
 or system directories.
@@ -135,8 +182,8 @@ or system directories.
 
 `CancellationToken` wraps a standard-library threading event. Cancellation is
 idempotent, one-way, and independent of any Qt event loop. Each restarted scan
-needs a fresh token. `scan_directory` is still a synchronous operation; its future
-application/Qt adapter will own background execution.
+needs a fresh token. `scan_directory` remains synchronous; the Qt adapter owns
+background execution.
 
 The scanner polls cancellation before and between setup stages, iterator work,
 metadata access, and index updates. Child-directory resources have explicit
@@ -161,8 +208,8 @@ are emitted separately and may be closer together. There is no pre-count or
 estimated percentage. With no callback, no progress snapshots are allocated.
 
 Callbacks execute synchronously in the scanning thread, without holding a token
-lock. They can request cancellation. Future UI callbacks must enqueue immutable
-snapshots for the GUI thread. Exceptions from callbacks are wrapped in
+lock. They can request cancellation. UI callbacks enqueue immutable snapshots
+for the GUI thread. Exceptions from callbacks are wrapped in
 `ProgressCallbackError` with their original cause, then propagated; they must not
 be mistaken for failures in the temporary index.
 
@@ -172,11 +219,57 @@ match the returned result; cancellation during that terminal callback cannot
 retroactively change them. Total elapsed time includes setup, regular callbacks,
 and resource cleanup, but excludes terminal callback time. If setup or a callback
 raises instead of returning a result, no successful terminal event is guaranteed;
-the future worker adapter must signal that failure explicitly.
+the worker adapter signals that failure explicitly.
+
+## Desktop execution and presentation
+
+PySide6 is an optional runtime dependency. Importing `diskly.scanner` and using the
+terminal examples do not import Qt. The launcher imports the UI only after parsing
+arguments, so `python -m diskly --help` works without PySide6. A directory argument
+only preselects the field and never triggers a scan automatically.
+
+On Linux, application construction passes `-platformtheme generic` to Qt unless
+a platform theme was explicitly selected through `QT_QPA_PLATFORMTHEME`. Startup
+does not depend on detecting a Snap editor or desktop environment. This bypasses GTK's native
+initialization, which can abort on incompatible GNOME schemas before Python can
+handle an exception. It does not mutate the process environment or system settings,
+and other operating systems retain normal Qt integration. Generic integration
+uses Qt dialogs and may limit automatic system appearance detection. Palette
+selection and the display backend remain separate from platform-theme selection.
+
+`ScanController` owns one `QThread` per analysis and a fresh cancellation token.
+The thread calls the synchronous scanner, emitting immutable snapshots and a
+result or error through explicitly queued connections. Controller slots run in
+the GUI thread; workers never access widgets. Job IDs reject stale events, and
+the controller stays busy until the thread's `finished` signal. Result delivery
+alone does not permit another worker to start. Finished threads are released
+with `deleteLater`.
+
+Closing while busy records a pending close and requests cancellation. The close
+event is deferred until the worker finishes, without calling `wait`, terminating
+the thread, or blocking the GUI event loop. Uninterruptible filesystem I/O can
+therefore delay closure, as it delays scanner cancellation. No scan can start
+while closure is pending.
+
+Tables retain only the result's bounded file/directory rankings and issue sample.
+Numeric sorting uses raw values rather than formatted unit strings. Search is a
+case-insensitive filter over retained rows, not a persistent filesystem index.
+Paths, errors, and details use plain text; control, formatting, and surrogate
+characters are escaped before display. Root overview and row details distinguish
+unique global totals, overlapping apparent directory sizes, scope, and incomplete
+observations. Unknown allocation stays distinct from zero.
+
+The interface uses Fusion with light, dark, or system-selected palettes. Tests
+use pytest-qt with Qt's offscreen platform and disposable directories. They cover
+real background scans, sorting/filtering, partial results, missing roots,
+unavailable allocation, unusual names, stale events, cancellation, deferred close,
+GUI-thread delivery, keyboard focus, and palette changes. Event-controlled fake
+scans exercise blocked work while verifying that the GUI event loop still runs.
 
 ## References
 
 - [Python filesystem interfaces](https://docs.python.org/3.12/library/os.html)
+- [Bounded heap operations](https://docs.python.org/3.12/library/heapq.html)
 - [Linux mountinfo](https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html)
 - [Linux descriptor metadata](https://man7.org/linux/man-pages/man5/proc_pid_fdinfo.5.html)
 - [XDG base directories](https://specifications.freedesktop.org/basedir/latest/)
